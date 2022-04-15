@@ -12,6 +12,8 @@ from vsutil import get_depth, split, join, scale_value
 from vsutil import depth as vsuDepth
 from rekt import rektlvls
 
+from .types.placebo import PlaceboTonemapOpts
+
 SUBTITLE_DEFAULT_STYLE: str = ("sans-serif,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
                                "0,0,0,0,100,100,0,0,1,2,0,7,10,10,10,1")
 
@@ -980,35 +982,31 @@ def DynamicTonemap(clip: vs.VideoNode,
                    chromaloc_s: str = "left",
                    reference: Optional[vs.VideoNode] = None,
                    predetermined_targets: Optional[Union[str, List[Union[int, float]]]] = None,
-                   is_dovi: bool = False,
                    target_nits: int = 203.0,
                    libplacebo: bool = True,
-                   placebo_dt: bool = True,
-                   placebo_algo: int = None,
-                   placebo_gamut_mode: int = None,
-                   placebo_mode: int = None,
-                   placebo_param: Optional[float] = None,
-                   placebo_use_frame_stats: bool = True) -> vs.VideoNode:
+                   placebo_opts: Optional[PlaceboTonemapOpts] = None) -> vs.VideoNode:
     """
-    The clip (or reference) is blurred, then plane stats are measured.
-    The tonemapping is then done according to the max RGB value.
+    Without libplacebo:
+        The clip (or reference) is blurred, then plane stats are measured.
+        The tonemapping is then done according to the max RGB value.
 
-    :param clip: PQ BT.2020 clip.
-    :param show: Whether to show nits values.
+    :param clip: HDR clip. PQ only if not using libplacebo.
+    :param show: Whether to show nits values as Subtitle.
     :param src_fmt: Whether to output source bit depth instead of 8-bit 4:4:4.
     :param adjust_gamma: Adjusts gamma/saturation dynamically on low brightness areas when target nits are high.
-        Requires adaptivegrain-rs plugin.
+        Requires `adaptivegrain-rs` plugin.
     :param chromaloc_in_s: Chromaloc of input
     :param chromaloc_s: Chromaloc of output
     :param reference: Reference clip to calculate target brightness with.
         Use cases include source/encode comparisons
+        Does not work when using libplacebo with `peak_detect=True`.
     :param predetermined_targets: List of target nits per frame.
         List of numbers or file containing a target per line
-        Must be equal to clip length
+        Must be equal to clip length.
+        Does not work when using libplacebo with `peak_detect=True`.
     :param libplacebo: Whether to use libplacebo as tonemapper
-        Requires vs-placebo plugin.
-    :param placebo_dt: Use libplacebo's dynamic peak detection instead of FrameEval
-    :param placebo_algo: The tonemapping algo to use
+        Requires `vs-placebo` plugin.
+    :param placebo_opts: See `PlaceboTonemapOpts`, for use with `libplacebo=True`
     :return: SDR YUV444P16 clip by default.
     """
 
@@ -1158,6 +1156,7 @@ def DynamicTonemap(clip: vs.VideoNode,
                 f: vs.VideoFrame,
                 clip: vs.VideoNode,
                 show: bool,
+                placebo_opts: PlaceboTonemapOpts,
                 targets: Optional[List[int]] = None,
                 range: Optional[str] = None) -> vs.VideoNode:
         max_rgb, frame_nits = __calculate_max_rgb(n, f, targets, range=range)
@@ -1175,23 +1174,11 @@ def DynamicTonemap(clip: vs.VideoNode,
         dst_max = target_nits
         dst_min = dst_max / 1000.0  # 1000:1 default
 
-        can_map_dovi = (is_dovi and 'DolbyVisionRPU' in fprops)
-
-        src_csp = 3 if can_map_dovi else 1
         is_full_range = fprops['_ColorRange'] == 0
 
-        tm_params = {
-            'src_csp': src_csp,
-            'dst_csp': 0,
-            'gamut_mode': placebo_gamut_mode,
-            'tone_mapping_function': placebo_algo,
-            'tone_mapping_param': placebo_param,
-            'tone_mapping_mode': placebo_mode,
-            'dst_max': dst_max,
-            'dst_min': dst_min,
-        }
+        tm_params = {'dst_max': dst_max, 'dst_min': dst_min, **placebo_opts.vsplacebo_dict()}
 
-        if placebo_use_frame_stats:
+        if placebo_opts.use_planestats:
             tm_params.update({
                 'src_max': src_max,
                 'src_min': src_min,
@@ -1237,32 +1224,34 @@ def DynamicTonemap(clip: vs.VideoNode,
     use_placebo = libplacebo and HasLoadedPlugin("com.vs.placebo")
 
     if use_placebo:
-        dst_fmt = vs.YUV444P16 if is_dovi else vs.RGB48
+        placebo_opts_final = placebo_opts
+        if not placebo_opts_final:
+            placebo_opts_final = PlaceboTonemapOpts()
+
+        dst_fmt = vs.YUV444P16 if placebo_opts_final.maps_dovi() else vs.RGB48
 
         clip = core.resize.Spline36(clip, format=dst_fmt, chromaloc_in_s=chromaloc_in_s, chromaloc_s=chromaloc_in_s)
 
-        if placebo_dt:
+        if placebo_opts_final.peak_detect:
             dst_max = target_nits
             dst_min = dst_max / 1000.0  # 1000:1 default
 
-            tm_params = {
-                'src_csp': 3 if is_dovi else 1,
-                'dst_csp': 0,
-                'gamut_mode': placebo_gamut_mode,
-                'tone_mapping_function': placebo_algo,
-                'tone_mapping_param': placebo_param,
-                'tone_mapping_mode': placebo_mode,
-                'dst_max': dst_max,
-                'dst_min': dst_min,
-            }
+            tm_params = {'dst_max': dst_max, 'dst_min': dst_min, **placebo_opts_final.vsplacebo_dict()}
 
             # Tonemap
-            tonemapped_clip = core.placebo.Tonemap(clip, dynamic_peak_detection=True, **tm_params)
+            tonemapped_clip = core.placebo.Tonemap(clip, **tm_params)
         else:
+            if not placebo_opts_final.is_hdr10_src():
+                raise ValueError('Dynamic tonemapping using PlaneStats only supports HDR10 input clips')
+
             prop_src = __get_rgb_prop_src(clip, reference, target_list)
 
             tonemapped_clip = core.std.FrameEval(clip,
-                                                 partial(__pl_dt, clip=clip, targets=target_list, show=show),
+                                                 partial(__pl_dt,
+                                                         clip=clip,
+                                                         placebo_opts=placebo_opts_final,
+                                                         targets=target_list,
+                                                         show=show),
                                                  prop_src=prop_src)
 
         if tonemapped_clip.format.color_family == vs.YUV:
